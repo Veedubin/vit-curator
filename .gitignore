@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.installed.cfg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test / tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.cache
+
+# uv
+uv.lock.local
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Build / hatch artifacts
+/src/*.egg-info/
+
+# Pipeline runtime data (created by CLI runs)
+var/
+index.duckdb
+*.duckdb
+*.duckdb.wal
+
+# Benchmark artifacts
+bench_output/
