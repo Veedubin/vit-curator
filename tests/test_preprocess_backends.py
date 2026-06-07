@@ -8,6 +8,7 @@ Tests requiring DALI are guarded by VIT_CURATOR_TEST_DALI env var.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 import duckdb
@@ -17,6 +18,13 @@ from typer.testing import CliRunner
 from tests.conftest import make_rgb_image
 
 runner = CliRunner()
+
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+
+def _strip_ansi(s: str) -> str:
+    """Remove ANSI escape codes (e.g. Rich/Typer colored output)."""
+    return _ANSI_ESCAPE.sub("", s)
 
 
 # ---------------------------------------------------------------------------
@@ -226,15 +234,17 @@ def test_cli_help_output() -> None:
 
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
-    assert "pipeline" in result.output.lower()
-    assert "preprocess" in result.output.lower()
-    assert "ingest" in result.output.lower()
+    output = _strip_ansi(result.output)
+    assert "pipeline" in output.lower()
+    assert "preprocess" in output.lower()
+    assert "ingest" in output.lower()
 
     result = runner.invoke(app, ["preprocess", "--help"])
     assert result.exit_code == 0
-    assert "--src" in result.output
-    assert "--out" in result.output
-    assert "--presets" in result.output
+    output = _strip_ansi(result.output)
+    assert "--src" in output
+    assert "--out" in output
+    assert "--presets" in output
 
 
 def test_error_hierarchy() -> None:
@@ -250,15 +260,19 @@ def test_error_hierarchy() -> None:
         GPUError,
         HashError,
         UnifiedPipelineError,
+        ViTCuratorError,
         WriteError,
     )
 
-    # All specific errors inherit from UnifiedPipelineError
+    # All specific errors inherit from UnifiedPipelineError (legacy alias)
     assert issubclass(HashError, UnifiedPipelineError)
     assert issubclass(DecodeError, UnifiedPipelineError)
     assert issubclass(GPUError, UnifiedPipelineError)
     assert issubclass(WriteError, UnifiedPipelineError)
     assert issubclass(EncodeError, UnifiedPipelineError)
+
+    # New ViTCuratorError is a direct subclass of the legacy alias
+    assert issubclass(ViTCuratorError, UnifiedPipelineError)
 
     # Error codes are integers
     for code in [ERR_HASH, ERR_DECODE, ERR_GPU, ERR_WRITE, ERR_ENCODE]:

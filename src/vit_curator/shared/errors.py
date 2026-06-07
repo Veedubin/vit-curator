@@ -8,12 +8,22 @@ from __future__ import annotations
 
 
 class UnifiedPipelineError(Exception):
-    """Base exception for vit-curator errors."""
+    """Base exception for vit-curator errors.
+
+    .. deprecated::
+        Use :class:`ViTCuratorError` instead. This alias is kept for
+        backwards compatibility with the legacy ``unified-pipeline``
+        name; it will be removed in a future major release.
+    """
 
     def __init__(self, message: str, *, code: int | None = None) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+class ViTCuratorError(UnifiedPipelineError):
+    """Base exception for vit-curator errors (preferred name)."""
 
 
 class HashError(UnifiedPipelineError):
