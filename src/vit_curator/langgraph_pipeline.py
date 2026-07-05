@@ -28,7 +28,7 @@ class PipelineState(TypedDict, total=False):
     out_dir: str
     errors: list[str]
     quality_gate_approvals: dict[str, Any]
-    checkpoint_id: str
+    thread_id: str
     overall_ok: bool
 
 
@@ -212,15 +212,15 @@ class LangGraphExecutor:
         Yields:
             PipelineState after each node execution.
         """
-        config = {"configurable": {"thread_id": initial_state.get("checkpoint_id", "default")}}
+        config = {"configurable": {"thread_id": initial_state.get("thread_id", "default")}}
 
         yield from self._graph.stream(initial_state, config)
 
-    def resume(self, checkpoint_id: str, approval: dict[str, Any] | None = None):
+    def resume(self, thread_id: str, approval: dict[str, Any] | None = None):
         """Resume pipeline after human-in-the-loop interruption.
 
         Args:
-            checkpoint_id: The thread_id to resume.
+            thread_id: The thread_id to resume.
             approval: Dict of quality gate approvals.
 
         Yields:
@@ -228,21 +228,21 @@ class LangGraphExecutor:
         """
         from langgraph.types import Command  # noqa: PLC0415
 
-        config = {"configurable": {"thread_id": checkpoint_id}}
+        config = {"configurable": {"thread_id": thread_id}}
         resume_value = Command(resume=approval) if approval else None
 
         yield from self._graph.stream(resume_value, config)
 
-    def get_state(self, checkpoint_id: str) -> PipelineState | None:
+    def get_state(self, thread_id: str) -> PipelineState | None:
         """Get the current state for a checkpoint.
 
         Args:
-            checkpoint_id: The thread_id to query.
+            thread_id: The thread_id to query.
 
         Returns:
             Current PipelineState or None if not found.
         """
-        config = {"configurable": {"thread_id": checkpoint_id}}
+        config = {"configurable": {"thread_id": thread_id}}
         state = self._graph.get_state(config)
         if state and state.values:
             return state.values

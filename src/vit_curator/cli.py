@@ -691,7 +691,7 @@ def _run_stages_langgraph(
     executor = LangGraphExecutor(checkpoint_dir=checkpoint_dir)
 
     # Build initial state
-    checkpoint_id = config_path.stem
+    thread_id = config_path.stem
     initial_state: PipelineState = {
         "config_path": str(config_path),
         "stages_to_run": stages_to_run,
@@ -701,12 +701,12 @@ def _run_stages_langgraph(
         "out_dir": str(out_dir),
         "errors": [],
         "quality_gate_approvals": {},
-        "checkpoint_id": checkpoint_id,
+        "thread_id": thread_id,
         "overall_ok": True,
     }
 
     # Check for existing checkpoint
-    existing_state = executor.get_state(checkpoint_id)
+    existing_state = executor.get_state(thread_id)
     if existing_state and existing_state.get("stage_results"):
         completed = [
             s for s, r in existing_state["stage_results"].items() if r.get("status") == "ok"
@@ -720,7 +720,7 @@ def _run_stages_langgraph(
         initial_state = existing_state
 
     # Run pipeline
-    console.print(f"[cyan]Checkpoint ID: {checkpoint_id}[/]")
+    console.print(f"[cyan]Thread ID: {thread_id}[/]")
     console.print(f"[cyan]Checkpoint dir: {checkpoint_dir}[/]\n")
 
     try:

@@ -28,8 +28,8 @@ jobs:
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
 
-      - name: Sync dependencies (dev + train + label + tui + embed)
-        run: uv sync --extra dev --extra train --extra label --extra tui --extra embed
+      - name: Sync dependencies (dev + train + label + tui + embed + langgraph)
+        run: uv sync --extra dev --extra train --extra label --extra tui --extra embed --extra langgraph
 
       - name: Lint (ruff)
         run: uv run --no-sync ruff check .

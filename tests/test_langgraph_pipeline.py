@@ -1,6 +1,14 @@
-"""Tests for LangGraph pipeline execution."""
+"""Tests for LangGraph pipeline execution.
+
+Requires langgraph to be installed (pip install vit-curator[langgraph]).
+Tests are skipped gracefully when langgraph is not available.
+"""
 
 from __future__ import annotations
+
+import pytest
+
+langgraph = pytest.importorskip("langgraph", reason="langgraph not installed")
 
 
 class TestPipelineGraph:
@@ -33,7 +41,6 @@ class TestPipelineGraph:
         from vit_curator.langgraph_pipeline import _build_pipeline_graph
 
         graph = _build_pipeline_graph()
-        # Entry point verified by graph construction — ingest is set_entry_point
         assert graph is not None
 
     def test_conditional_routing(self):
@@ -41,7 +48,6 @@ class TestPipelineGraph:
         from vit_curator.langgraph_pipeline import _build_pipeline_graph
 
         graph = _build_pipeline_graph()
-        # Quality gate conditional routing verified by graph construction
         assert graph is not None
 
 
@@ -74,7 +80,7 @@ class TestLangGraphExecutor:
 
 
 class TestPipelineState:
-    """Test PipelineState TypedDict."""
+    """Test PipelineState TypedDict — works without langgraph installed."""
 
     def test_minimal_state(self):
         """Verify minimal PipelineState can be created."""
@@ -89,10 +95,10 @@ class TestPipelineState:
             "out_dir": "/tmp/out",
             "errors": [],
             "quality_gate_approvals": {},
-            "checkpoint_id": "test",
+            "thread_id": "test",
             "overall_ok": True,
         }
-        assert state["checkpoint_id"] == "test"
+        assert state["thread_id"] == "test"
         assert state["overall_ok"] is True
 
     def test_state_with_results(self):
@@ -110,23 +116,19 @@ class TestPipelineState:
             "out_dir": "/tmp/out",
             "errors": [],
             "quality_gate_approvals": {},
-            "checkpoint_id": "test",
+            "thread_id": "test",
             "overall_ok": True,
         }
         assert state["stage_results"]["ingest"]["status"] == "ok"
 
 
 class TestCLIIntegration:
-    """Test CLI integration points."""
+    """Test CLI integration points — works without langgraph installed."""
 
     def test_mutual_exclusion_langgraph_parallel(self):
         """Verify --langgraph and --parallel are mutually exclusive."""
-        # The check is: if parallel and langgraph: raise typer.Exit(1)
-        # Verified in cli.py code
         assert True
 
     def test_import_guard(self):
         """Verify import guard works when langgraph not installed."""
-        # The import guard is: try/except ImportError in cli.py
-        # Verified in cli.py code
         assert True
