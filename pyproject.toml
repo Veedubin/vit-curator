@@ -1,6 +1,6 @@
 [project]
 name = "vit-curator"
-version = "0.3.1"
+version = "0.3.2"
 description = "End-to-end ML curation pipeline: image ingest, preprocess, VLM label, train/predict, and RAG-style chunk/embed/enrich — single CLI, single DuckDB."
 readme = "README.md"
 requires-python = ">=3.11"
