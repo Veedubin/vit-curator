@@ -42,15 +42,15 @@ def _build_pipeline_graph():
     Quality gate on label stage: if OCR confidence < 80%, routes to retry_label
     which switches model and routes back to label.
     """
-    from langgraph.graph import END, StateGraph
-    from langgraph.checkpoint.memory import MemorySaver
+    from langgraph.graph import END, StateGraph  # noqa: PLC0415
+    from langgraph.checkpoint.memory import MemorySaver  # noqa: PLC0415
 
     # Define stage nodes
     def _make_stage_node(stage_name: str):
         """Create a node function for a pipeline stage."""
 
-        def _node(state: PipelineState) -> PipelineState:
-            from vit_curator.cli import _run_stage
+    def _node(state: PipelineState) -> PipelineState:
+        from vit_curator.cli import _run_stage  # noqa: PLC0415
 
             stage_cfg = state["cfg_data"].get(stage_name, {})
             if not stage_cfg:
@@ -192,7 +192,7 @@ class LangGraphExecutor:
 
         if checkpoint_dir:
             try:
-                from langgraph.checkpoint.sqlite import SqliteSaver
+                from langgraph.checkpoint.sqlite import SqliteSaver  # noqa: PLC0415
 
                 checkpoint_dir.mkdir(parents=True, exist_ok=True)
                 db_path = str(checkpoint_dir / "pipeline_checkpoints.db")
@@ -227,7 +227,7 @@ class LangGraphExecutor:
         Yields:
             PipelineState after each node execution.
         """
-        from langgraph.types import Command
+        from langgraph.types import Command  # noqa: PLC0415
 
         config = {"configurable": {"thread_id": checkpoint_id}}
         resume_value = Command(resume=approval) if approval else None

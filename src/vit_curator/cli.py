@@ -23,7 +23,9 @@ import time
 from pathlib import Path
 from typing import Any
 
+import networkx as nx
 import typer
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from rich.console import Console
 from rich.table import Table
 
@@ -456,8 +458,6 @@ def run_all(
         console.print(f"[cyan]Config file: {config}[/]")
         console.print(f"[cyan]Stages to run: {', '.join(stages_to_run)}[/]")
         if parallel:
-            import networkx as nx
-
             G = _build_pipeline_dag(stages_to_run)
             if nx.is_directed_acyclic_graph(G):
                 generations = list(nx.topological_generations(G))
@@ -488,12 +488,12 @@ def run_all(
     # Execute stages (langgraph, parallel, or sequential)
     if langgraph:
         try:
-            from vit_curator.langgraph_pipeline import LangGraphExecutor, PipelineState  # noqa: PLC0415
+            import vit_curator.langgraph_pipeline  # noqa: PLC0415
         except ImportError:
             console.print(
                 "[red]langgraph not installed. Install with: pip install vit-curator[langgraph][/]"
             )
-            raise typer.Exit(1)
+            raise typer.Exit(1) from None
 
         console.print("[cyan]LangGraph mode enabled — stateful execution with checkpointing[/]")
         overall_ok = _run_stages_langgraph(stages_to_run, cfg_data, config, console)
@@ -514,14 +514,13 @@ def run_all(
         raise typer.Exit(1)
 
 
-def _build_pipeline_dag(stages: list[str]) -> "nx.DiGraph":
+def _build_pipeline_dag(stages: list[str]) -> nx.DiGraph:
     """Build a directed acyclic graph of pipeline stage dependencies.
 
     Returns a NetworkX DiGraph where edges represent dependencies
     (A → B means B depends on A). Stages with no edges between them
     can run in parallel.
     """
-    import networkx as nx
 
     G = nx.DiGraph()
 
@@ -587,9 +586,6 @@ def _run_stages_parallel(
     Uses topological generations to identify independent stages that can
     run concurrently via ThreadPoolExecutor.
     """
-    import networkx as nx
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
     G = _build_pipeline_dag(stages_to_run)
 
     if not nx.is_directed_acyclic_graph(G):
@@ -683,7 +679,8 @@ def _run_stages_langgraph(
     - Quality gates: pauses at label stage for confidence review
     - Conditional retry: retries label with different model on failure
     """
-    from vit_curator.langgraph_pipeline import LangGraphExecutor, PipelineState  # noqa: PLC0415
+    import vit_curator.langgraph_pipeline  # noqa: PLC0415
+    from vit_curator.langgraph_pipeline import LangGraphExecutor, PipelineState
 
     # Determine checkpoint directory
     out_dir = cfg_data.get("pipeline", {}).get(
@@ -1385,7 +1382,7 @@ def knowledge_graph(
         if co_occurring:
             console.print(f"\n[bold]Co-occurring with '{query_entity}':[/]")
             for entity, count in co_occurring:
-                console.print(f"  {entity}: {count}×")
+                console.print(f"  {entity}: {count}x")
 
         images = kg.get_images_for_entity(query_entity)
         if images:
