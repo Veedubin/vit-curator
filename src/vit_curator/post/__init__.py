@@ -6,6 +6,7 @@ Provides:
   - Embedder / EmbedConfig: semantic embeddings via sentence-transformers
   - Enricher / EnrichConfig / EnrichmentResult: LLM-based document enrichment
   - run_chunking / run_embedding / run_enrichment: high-level entry points
+  - ImageKnowledgeGraph / EntityInfo / KGQueryResult: cross-document knowledge graph
 
 Lazy imports are used for sentence-transformers and httpx to avoid heavy
 dependencies at package load time.
@@ -14,6 +15,7 @@ dependencies at package load time.
 from __future__ import annotations
 
 from vit_curator.post.chunk import ChunkConfig, Chunker, chunk_text, run_chunking
+from vit_curator.post.knowledge_graph import EntityInfo, ImageKnowledgeGraph, KGQueryResult
 
 __all__ = [
     "ChunkConfig",
@@ -24,6 +26,9 @@ __all__ = [
     "EnrichConfig",
     "Enricher",
     "EnrichmentResult",
+    "EntityInfo",
+    "ImageKnowledgeGraph",
+    "KGQueryResult",
     "chunk_text",
     "run_chunking",
     "run_embedding",

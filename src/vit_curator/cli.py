@@ -13,6 +13,7 @@ Provides commands for all pipeline stages:
   - embed:      Semantic embeddings for chunks
   - enrich:     LLM-based document enrichment
   - perceptual-dedupe: Near-duplicate image detection via phash
+  - layout-graph: Build spatial relationship graph from OCR/label output
   - run-all:    YAML config-driven pipeline chaining
 """
 
@@ -20,6 +21,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from typing import Any
 
 import typer
 from rich.console import Console
@@ -382,6 +384,14 @@ def run_all(
     stages: str | None = typer.Option(
         None, "--stages", help="Comma-separated stage list to run (default: all)"
     ),
+    parallel: bool = typer.Option(
+        False, "--parallel", help="Run independent stages in parallel using NetworkX DAG analysis"
+    ),
+    langgraph: bool = typer.Option(
+        False,
+        "--langgraph",
+        help="Use LangGraph for stateful, resumable execution with checkpointing",
+    ),
 ) -> None:
     """Run the full pipeline from a YAML configuration file.
 
@@ -428,6 +438,10 @@ def run_all(
     else:
         stages_to_run = [s for s in available_stages if s in cfg_data]
 
+    if parallel and langgraph:
+        console.print("[red]--parallel and --langgraph are mutually exclusive.[/]")
+        raise typer.Exit(1)
+
     if not stages_to_run:
         console.print(
             "[yellow]No stages configured. Add sections: "
@@ -441,6 +455,22 @@ def run_all(
         console.print("[cyan]DRY RUN — Configuration Valid[/]")
         console.print(f"[cyan]Config file: {config}[/]")
         console.print(f"[cyan]Stages to run: {', '.join(stages_to_run)}[/]")
+        if parallel:
+            import networkx as nx
+
+            G = _build_pipeline_dag(stages_to_run)
+            if nx.is_directed_acyclic_graph(G):
+                generations = list(nx.topological_generations(G))
+                console.print("[cyan]DAG execution plan (parallel groups):[/]")
+                for gen_idx, generation in enumerate(generations):
+                    console.print(f"  Gen {gen_idx}: {', '.join(generation)}")
+                try:
+                    critical_path = nx.dag_longest_path(G)
+                    console.print(f"[cyan]Critical path: {' → '.join(critical_path)}[/]")
+                except Exception:
+                    pass
+            else:
+                console.print("[red]DAG contains cycles — would fall back to sequential[/]")
         for stage in stages_to_run:
             stage_cfg = cfg_data.get(stage, {})
             console.print(f"\n[bold]{stage}:[/]")
@@ -449,13 +479,83 @@ def run_all(
         console.print(f"\n[cyan]{'=' * 60}[/]")
         return
 
-    # Execute stages sequentially
     pipeline_name = cfg_data.get("pipeline", {}).get("name", "vit-curator")
     console.print(f"[green]{'=' * 60}[/]")
     console.print(f"[bold green]Running: {pipeline_name}[/]")
     console.print(f"[green]Stages: {', '.join(stages_to_run)}[/]")
     console.print(f"[green]{'=' * 60}[/]\n")
 
+    # Execute stages (langgraph, parallel, or sequential)
+    if langgraph:
+        try:
+            from vit_curator.langgraph_pipeline import LangGraphExecutor, PipelineState  # noqa: PLC0415
+        except ImportError:
+            console.print(
+                "[red]langgraph not installed. Install with: pip install vit-curator[langgraph][/]"
+            )
+            raise typer.Exit(1)
+
+        console.print("[cyan]LangGraph mode enabled — stateful execution with checkpointing[/]")
+        overall_ok = _run_stages_langgraph(stages_to_run, cfg_data, config, console)
+    elif parallel:
+        console.print("[cyan]Parallel mode enabled — using NetworkX DAG analysis[/]")
+        overall_ok = _run_stages_parallel(stages_to_run, cfg_data, console)
+    else:
+        overall_ok = _run_stages_sequential(stages_to_run, cfg_data, console)
+
+    if overall_ok:
+        console.print(f"[bold green]{'=' * 60}[/]")
+        console.print("[bold green]Pipeline complete![/]")
+        console.print(f"[bold green]{'=' * 60}[/]")
+    else:
+        console.print(f"[bold red]{'=' * 60}[/]")
+        console.print("[bold red]Pipeline stopped due to error.[/]")
+        console.print(f"[bold red]{'=' * 60}[/]")
+        raise typer.Exit(1)
+
+
+def _build_pipeline_dag(stages: list[str]) -> "nx.DiGraph":
+    """Build a directed acyclic graph of pipeline stage dependencies.
+
+    Returns a NetworkX DiGraph where edges represent dependencies
+    (A → B means B depends on A). Stages with no edges between them
+    can run in parallel.
+    """
+    import networkx as nx
+
+    G = nx.DiGraph()
+
+    # Add all stages as nodes
+    for stage in stages:
+        G.add_node(stage)
+
+    # Define known dependencies between stages
+    dependencies = [
+        ("ingest", "preprocess"),  # preprocess needs ingested files
+        ("preprocess", "label"),  # label needs preprocessed images
+        ("label", "train"),  # train needs labels
+        ("train", "evaluate"),  # evaluate needs trained model
+        ("train", "predict"),  # predict needs trained model
+        ("evaluate", "predict"),  # predict should run after evaluate
+        ("predict", "chunk"),  # chunk needs predictions
+        ("chunk", "embed"),  # embed needs chunks
+        ("embed", "enrich"),  # enrich can use embeddings
+    ]
+
+    # Only add edges for stages that are actually in the pipeline
+    for src, dst in dependencies:
+        if src in stages and dst in stages:
+            G.add_edge(src, dst)
+
+    return G
+
+
+def _run_stages_sequential(
+    stages_to_run: list[str],
+    cfg_data: dict,
+    console: Console,
+) -> bool:
+    """Run pipeline stages sequentially (original behavior)."""
     overall_ok = True
     for stage in stages_to_run:
         stage_cfg = cfg_data.get(stage, {})
@@ -474,16 +574,186 @@ def run_all(
             console.print(f"[red]  ✗ {stage} failed after {elapsed:.1f}s: {exc}[/]\n")
             overall_ok = False
             break
+    return overall_ok
 
-    if overall_ok:
-        console.print(f"[bold green]{'=' * 60}[/]")
-        console.print("[bold green]Pipeline complete![/]")
-        console.print(f"[bold green]{'=' * 60}[/]")
-    else:
-        console.print(f"[bold red]{'=' * 60}[/]")
-        console.print("[bold red]Pipeline stopped due to error.[/]")
-        console.print(f"[bold red]{'=' * 60}[/]")
-        raise typer.Exit(1)
+
+def _run_stages_parallel(
+    stages_to_run: list[str],
+    cfg_data: dict,
+    console: Console,
+) -> bool:
+    """Run pipeline stages in parallel where possible using NetworkX DAG analysis.
+
+    Uses topological generations to identify independent stages that can
+    run concurrently via ThreadPoolExecutor.
+    """
+    import networkx as nx
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    G = _build_pipeline_dag(stages_to_run)
+
+    if not nx.is_directed_acyclic_graph(G):
+        console.print("[red]Pipeline DAG contains cycles! Falling back to sequential.[/]")
+        return _run_stages_sequential(stages_to_run, cfg_data, console)
+
+    # Get topological generations (groups of independent stages)
+    generations = list(nx.topological_generations(G))
+
+    # Find critical path for reporting
+    try:
+        critical_path = nx.dag_longest_path(G)
+        console.print(f"[dim]Critical path: {' → '.join(critical_path)}[/]")
+    except Exception:
+        pass
+
+    overall_ok = True
+    stage_results: dict[str, bool] = {}
+
+    for gen_idx, generation in enumerate(generations):
+        if len(generation) == 1:
+            # Single stage — run directly
+            stage = generation[0]
+            stage_cfg = cfg_data.get(stage, {})
+            if not stage_cfg:
+                console.print(f"[yellow]Skipping {stage} — no configuration.[/]")
+                stage_results[stage] = True
+                continue
+
+            console.print(f"[bold cyan]→ Stage: {stage} (gen {gen_idx})[/]")
+            start = time.time()
+            try:
+                _run_stage(stage, stage_cfg, console)
+                elapsed = time.time() - start
+                console.print(f"[green]  ✓ {stage} complete ({elapsed:.1f}s)[/]\n")
+                stage_results[stage] = True
+            except Exception as exc:
+                elapsed = time.time() - start
+                console.print(f"[red]  ✗ {stage} failed after {elapsed:.1f}s: {exc}[/]\n")
+                stage_results[stage] = False
+                overall_ok = False
+                break
+        else:
+            # Multiple independent stages — run in parallel
+            console.print(
+                f"[bold cyan]→ Generation {gen_idx}: {', '.join(generation)} (parallel)[/]"
+            )
+
+            def _run_one(stage: str) -> tuple[str, bool, str]:
+                stage_cfg = cfg_data.get(stage, {})
+                if not stage_cfg:
+                    return (stage, True, "skipped")
+                t0 = time.time()
+                try:
+                    _run_stage(stage, stage_cfg, console)
+                    elapsed = time.time() - t0
+                    return (stage, True, f"{elapsed:.1f}s")
+                except Exception as exc:
+                    elapsed = time.time() - t0
+                    return (stage, False, f"failed after {elapsed:.1f}s: {exc}")
+
+            with ThreadPoolExecutor(max_workers=len(generation)) as executor:
+                futures = {executor.submit(_run_one, stage): stage for stage in generation}
+                for future in as_completed(futures):
+                    stage, ok, msg = future.result()
+                    if ok:
+                        console.print(f"[green]  ✓ {stage} ({msg})[/]")
+                    else:
+                        console.print(f"[red]  ✗ {stage} ({msg})[/]")
+                        overall_ok = False
+                    stage_results[stage] = ok
+
+            console.print()
+
+            if not overall_ok:
+                break
+
+    return overall_ok
+
+
+def _run_stages_langgraph(
+    stages_to_run: list[str],
+    cfg_data: dict,
+    config_path: Path,
+    console: Console,
+) -> bool:
+    """Run pipeline stages using LangGraph for stateful, resumable execution.
+
+    Features:
+    - Checkpoint/resume: survives crashes, resumes from last completed stage
+    - Quality gates: pauses at label stage for confidence review
+    - Conditional retry: retries label with different model on failure
+    """
+    from vit_curator.langgraph_pipeline import LangGraphExecutor, PipelineState  # noqa: PLC0415
+
+    # Determine checkpoint directory
+    out_dir = cfg_data.get("pipeline", {}).get(
+        "out_dir",
+        str(config_path.parent / "checkpoints"),
+    )
+    checkpoint_dir = Path(out_dir)
+
+    executor = LangGraphExecutor(checkpoint_dir=checkpoint_dir)
+
+    # Build initial state
+    checkpoint_id = config_path.stem
+    initial_state: PipelineState = {
+        "config_path": str(config_path),
+        "stages_to_run": stages_to_run,
+        "stage_results": {},
+        "current_stage": "",
+        "cfg_data": cfg_data,
+        "out_dir": str(out_dir),
+        "errors": [],
+        "quality_gate_approvals": {},
+        "checkpoint_id": checkpoint_id,
+        "overall_ok": True,
+    }
+
+    # Check for existing checkpoint
+    existing_state = executor.get_state(checkpoint_id)
+    if existing_state and existing_state.get("stage_results"):
+        completed = [
+            s for s, r in existing_state["stage_results"].items() if r.get("status") == "ok"
+        ]
+        console.print(
+            f"[cyan]Resuming from checkpoint. Completed stages: {', '.join(completed)}[/]"
+        )
+        # Use existing state but update stages_to_run
+        existing_state["stages_to_run"] = stages_to_run
+        existing_state["cfg_data"] = cfg_data
+        initial_state = existing_state
+
+    # Run pipeline
+    console.print(f"[cyan]Checkpoint ID: {checkpoint_id}[/]")
+    console.print(f"[cyan]Checkpoint dir: {checkpoint_dir}[/]\n")
+
+    try:
+        for event in executor.run(initial_state):
+            for node_name, node_state in event.items():
+                stage = node_state.get("current_stage", node_name)
+                result = node_state.get("stage_results", {}).get(stage, {})
+
+                if result.get("status") == "ok":
+                    console.print(
+                        f"[green]  ✓ {stage} complete ({result.get('elapsed', 0):.1f}s)[/]"
+                    )
+                elif result.get("status") == "error":
+                    console.print(f"[red]  ✗ {stage} failed: {result.get('error', 'unknown')}[/]")
+                elif result.get("status") == "skipped":
+                    console.print(f"[yellow]  - {stage} skipped[//]")
+
+        return initial_state.get("overall_ok", True)
+
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Pipeline interrupted. State saved to checkpoint.[/]")
+        console.print(
+            f"[yellow]Resume with: vit-curator run-all --config {config_path} --langgraph[/]"
+        )
+        return False
+    except Exception as exc:
+        console.print(f"[red]Pipeline failed: {exc}[/]")
+        console.print("[yellow]State saved to checkpoint. Resume with --langgraph[/]")
+        return False
 
 
 def _run_stage(stage: str, cfg: dict, console: Console) -> None:
@@ -853,6 +1123,291 @@ def perceptual_dedupe(
         f"{result.near_dupes_found} near-dupes found, "
         f"{result.canonicals} canonicals.[/]"
     )
+
+
+# ---------------------------------------------------------------------------
+# Layout graph
+# ---------------------------------------------------------------------------
+
+
+@app.command("layout-graph")
+def layout_graph(
+    db: Path = typer.Option(Path("var/duckdb/labels.duckdb"), "--db", help="DuckDB path"),
+    run_id: str | None = typer.Option(None, "--run-id", help="Filter by run_id for label data"),
+    output: Path | None = typer.Option(None, "--output", help="Output path for GraphML file"),
+    row_tolerance: float = typer.Option(
+        20.0, "--row-tolerance", help="Vertical pixel tolerance for same-row detection"
+    ),
+    col_tolerance: float = typer.Option(
+        20.0, "--col-tolerance", help="Horizontal pixel tolerance for same-column detection"
+    ),
+    max_blocks: int | None = typer.Option(
+        None, "--max-blocks", help="Maximum number of blocks to process"
+    ),
+) -> None:
+    """Build a spatial relationship graph from OCR/label output.
+
+    Analyzes document layout using NetworkX graph algorithms:
+    - Reading order inference
+    - Table detection via community detection
+    - Region grouping via connected components
+
+    Outputs GraphML for visualization in tools like Gephi or Cytoscape.
+    """
+    import json  # noqa: PLC0415
+
+    from vit_curator.post.layout_graph import (  # noqa: PLC0415
+        DocumentLayoutGraph,
+        LayoutBlock,
+    )
+
+    database = _open_db(db)
+    con = database.con
+
+    # Query label data from the database
+    query = """
+        SELECT l.text, l.bbox, l.label, l.confidence
+        FROM labels l
+        JOIN files f ON l.file_pk = f.file_pk
+        WHERE 1=1
+    """
+    params: list[Any] = []
+
+    if run_id:
+        query += " AND l.run_id = ?"
+        params.append(run_id)
+
+    if max_blocks:
+        query += " LIMIT ?"
+        params.append(max_blocks)
+
+    try:
+        rows = con.execute(query, params).fetchall()
+    except Exception as e:
+        console.print(f"[red]Failed to query labels: {e}[/]")
+        console.print("[yellow]Tip: Run 'label' stage first to populate label data.[/]")
+        raise typer.Exit(1) from e
+
+    if not rows:
+        console.print("[yellow]No label data found. Run the 'label' stage first.[/]")
+        raise typer.Exit(0)
+
+    # Build blocks from query results
+    blocks: list[LayoutBlock] = []
+    for row in rows:
+        text = str(row[0]) if row[0] else ""
+        bbox_raw = row[1]
+
+        # Parse bbox (could be JSON string or list)
+        if isinstance(bbox_raw, str):
+            try:
+                bbox_raw = json.loads(bbox_raw)
+            except json.JSONDecodeError:
+                bbox_raw = [0, 0, 0, 0]
+
+        if isinstance(bbox_raw, list) and len(bbox_raw) >= 4:
+            if len(bbox_raw) == 8:
+                xs = [bbox_raw[0], bbox_raw[2], bbox_raw[4], bbox_raw[6]]
+                ys = [bbox_raw[1], bbox_raw[3], bbox_raw[5], bbox_raw[7]]
+                bbox = (min(xs), min(ys), max(xs), max(ys))
+            else:
+                bbox = (
+                    float(bbox_raw[0]),
+                    float(bbox_raw[1]),
+                    float(bbox_raw[2]),
+                    float(bbox_raw[3]),
+                )
+        else:
+            bbox = (0.0, 0.0, 0.0, 0.0)
+
+        blocks.append(
+            LayoutBlock(
+                text=text,
+                bbox=bbox,
+                label=str(row[2]) if len(row) > 2 and row[2] else "text",
+                confidence=float(row[3]) if len(row) > 3 and row[3] else 1.0,
+            )
+        )
+
+    # Build and analyze the graph
+    graph = DocumentLayoutGraph(row_tolerance=row_tolerance, col_tolerance=col_tolerance)
+    graph.add_blocks(blocks)
+    result = graph.analyze()
+
+    # Display results
+    table = Table(title="Layout Graph Analysis")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", style="green")
+    table.add_row("Blocks", str(result.num_blocks))
+    table.add_row("Edges", str(result.num_edges))
+    table.add_row("Reading order length", str(len(result.reading_order)))
+    table.add_row("Tables detected", str(len(result.tables)))
+    table.add_row("Regions detected", str(len(result.regions)))
+    console.print(table)
+
+    # Show table details
+    if result.tables:
+        console.print("\n[bold]Tables detected:[/]")
+        for i, table_nodes in enumerate(result.tables):
+            texts = [graph.G.nodes[n]["text"][:30] for n in table_nodes[:5]]
+            console.print(f"  Table {i + 1}: {len(table_nodes)} cells — {', '.join(texts)}...")
+
+    # Show region details
+    if result.regions:
+        console.print(f"\n[bold]Regions: {len(result.regions)}[/]")
+        for i, region_nodes in enumerate(result.regions[:5]):
+            texts = [graph.G.nodes[n]["text"][:30] for n in region_nodes[:3]]
+            console.print(f"  Region {i + 1}: {len(region_nodes)} blocks — {', '.join(texts)}")
+
+    # Save GraphML if requested
+    if output:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(result.graph_ml)
+        console.print(f"\n[green]GraphML saved to: {output}[/]")
+
+
+# ---------------------------------------------------------------------------
+# Knowledge graph command
+# ---------------------------------------------------------------------------
+
+
+@app.command("knowledge-graph")
+def knowledge_graph(
+    db: Path = typer.Option(Path("var/duckdb/labels.duckdb"), "--db", help="DuckDB path"),
+    run_id: str | None = typer.Option(None, "--run-id", help="Filter by run_id for label data"),
+    output: Path | None = typer.Option(None, "--output", help="Output path for GraphML file"),
+    query_entity: str | None = typer.Option(
+        None, "--query-entity", help="Find connections for a specific entity"
+    ),
+    query_image: str | None = typer.Option(
+        None, "--query-image", help="Find images similar to this image ID"
+    ),
+    max_entities: int | None = typer.Option(
+        None, "--max-entities", help="Maximum number of entities to process"
+    ),
+    top_k: int = typer.Option(10, "--top-k", help="Number of top results to show"),
+) -> None:
+    """Build a cross-document knowledge graph from extracted entities.
+
+    Links entities across documents, enabling:
+    - Cross-document entity search ("find all images with 'Acme Corp'")
+    - Similar image discovery via shared entities
+    - Entity co-occurrence analysis
+    - Concept hierarchy building
+
+    Outputs GraphML for visualization in tools like Gephi or Cytoscape.
+    """
+    from vit_curator.post.knowledge_graph import (  # noqa: PLC0415
+        EntityInfo,
+        ImageKnowledgeGraph,
+    )
+
+    database = _open_db(db)
+    con = database.con
+
+    # Query label data from the database
+    query = """
+        SELECT f.file_pk, l.text, l.label, l.confidence
+        FROM labels l
+        JOIN files f ON l.file_pk = f.file_pk
+        WHERE l.text IS NOT NULL AND l.text != ''
+    """
+    params: list[Any] = []
+
+    if run_id:
+        query += " AND l.run_id = ?"
+        params.append(run_id)
+
+    if max_entities:
+        query += " LIMIT ?"
+        params.append(max_entities)
+
+    try:
+        rows = con.execute(query, params).fetchall()
+    except Exception as e:
+        console.print(f"[red]Failed to query labels: {e}[/]")
+        console.print("[yellow]Tip: Run 'label' stage first to populate label data.[/]")
+        raise typer.Exit(1) from e
+
+    if not rows:
+        console.print("[yellow]No label data found. Run the 'label' stage first.[/]")
+        raise typer.Exit(0)
+
+    # Build knowledge graph
+    kg = ImageKnowledgeGraph()
+
+    # Group entities by image
+    from collections import defaultdict  # noqa: PLC0415
+
+    image_entities: dict[str, list[EntityInfo]] = defaultdict(list)
+
+    for row in rows:
+        file_pk = str(row[0])
+        text = str(row[1]) if row[1] else ""
+        label = str(row[2]) if len(row) > 2 and row[2] else "entity"
+        confidence = float(row[3]) if len(row) > 3 and row[3] else 1.0
+
+        if text:
+            image_entities[file_pk].append(
+                EntityInfo(text=text, label=label, confidence=confidence, image_id=file_pk)
+            )
+
+    for image_id, entities in image_entities.items():
+        kg.load_from_entities(image_id, entities)
+
+    # Display stats
+    stats = kg.get_stats()
+    table = Table(title="Knowledge Graph Statistics")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", style="green")
+    for key, value in stats.items():
+        table.add_row(key.replace("_", " ").title(), f"{value:,}")
+    console.print(table)
+
+    # Top entities
+    top_entities = kg.get_top_entities(top_k=top_k)
+    if top_entities:
+        console.print(f"\n[bold]Top {min(top_k, len(top_entities))} Entities:[/]")
+        for entity, count in top_entities:
+            console.print(f"  {entity}: {count} images")
+
+    # Query specific entity if requested
+    if query_entity:
+        console.print(f"\n[bold]Entity Connections for '{query_entity}':[/]")
+        connections = kg.find_entity_connections(query_entity)
+        if connections:
+            for conn in connections[:top_k]:
+                console.print(f"  {conn['source']} --[{conn['relation']}]--> {conn['target']}")
+        else:
+            console.print("  No connections found.")
+
+        co_occurring = kg.find_co_occurring_entities(query_entity, top_k=top_k)
+        if co_occurring:
+            console.print(f"\n[bold]Co-occurring with '{query_entity}':[/]")
+            for entity, count in co_occurring:
+                console.print(f"  {entity}: {count}×")
+
+        images = kg.get_images_for_entity(query_entity)
+        if images:
+            console.print(f"\n[bold]Images containing '{query_entity}': {len(images)}[/]")
+            for img in images[:top_k]:
+                console.print(f"  {img}")
+
+    # Query similar images if requested
+    if query_image:
+        console.print(f"\n[bold]Images similar to '{query_image}':[/]")
+        similar = kg.find_similar_images(query_image, top_k=top_k)
+        if similar:
+            for img_id, score in similar:
+                console.print(f"  {img_id}: {score:.4f}")
+        else:
+            console.print("  No similar images found.")
+
+    # Save GraphML if requested
+    if output:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(kg.to_graphml())
+        console.print(f"\n[green]GraphML saved to: {output}[/]")
 
 
 # ---------------------------------------------------------------------------

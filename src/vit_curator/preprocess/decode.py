@@ -1,7 +1,8 @@
-"""Image decode backends — CPU (PIL+torch) and optional DALI (GPU).
+"""Image decode backends — CPU (PIL+torch), optional libvips (pyvips), and DALI (GPU).
 
-CPU backend is always available. DALI backend requires the nvidia-dali-cuda120
-optional extra and is only imported on demand.
+CPU backend is always available. libvips backend requires the ``vips`` optional
+extra (``pip install pyvips``). DALI backend requires the ``dali`` optional
+extra and is only imported on demand.
 """
 
 from __future__ import annotations
@@ -28,13 +29,84 @@ class DecodedImage:
     height: int
 
 
-def decode_rgb_u8_chw(path: Path) -> DecodedImage:
+def decode_rgb_u8_chw_vips(path: Path) -> DecodedImage:
+    """Decode an image file into an RGB uint8 CHW torch Tensor using libvips.
+
+    libvips is demand-driven and horizontally threaded, making it 3-10x faster
+    than PIL for batch image processing.
+
+    Raises:
+      - ImportError if pyvips is not installed
+      - UnidentifiedImageError for non-images or unsupported formats
+      - Other exceptions for I/O, truncated images, etc.
+    """
+    try:
+        import pyvips
+    except ImportError:
+        raise ImportError("pyvips is not installed. Install with: pip install pyvips")
+
+    try:
+        image = pyvips.Image.new_from_file(str(path), access="sequential")
+
+        # Handle multi-page images (take first page)
+        if image.get_typeof("n-pages") != 0:
+            image = pyvips.Image.new_from_file(str(path), access="sequential", page=0)
+
+        # Convert to sRGB if needed
+        if image.interpretation != pyvips.Interpretation.SRGB:
+            image = image.colourspace(pyvips.Interpretation.SRGB)
+
+        # Ensure 3 bands (RGB)
+        if image.bands == 4:
+            # Remove alpha channel
+            image = image.extract_band(0, n=3)
+        elif image.bands == 1:
+            # Expand grayscale to RGB
+            image = image.bandjoin([image, image, image])
+        elif image.bands != 3:
+            raise UnidentifiedImageError(
+                f"Unexpected band count: {image.bands} (expected 1, 3, or 4)"
+            )
+
+        w = image.width
+        h = image.height
+
+        # Extract raw pixel data as numpy array (HWC uint8)
+        arr = image.numpy()
+
+        if arr.ndim != 3 or arr.shape[2] != 3:
+            raise UnidentifiedImageError(f"Unexpected decoded shape: {arr.shape}")
+
+        t = torch.from_numpy(arr.copy()).permute(2, 0, 1).contiguous()  # CHW uint8
+        return DecodedImage(img_u8_chw=t, width=int(w), height=int(h))
+
+    except pyvips.Error as e:
+        raise UnidentifiedImageError(f"libvips decode failed: {e}") from e
+
+
+def decode_rgb_u8_chw(path: Path, backend: str = "auto") -> DecodedImage:
     """Decode an image file into an RGB uint8 CHW torch Tensor (CPU).
+
+    Args:
+        path: Path to the image file.
+        backend: Decode backend - "auto" (try libvips, fall back to PIL),
+                 "vips" (libvips only), or "pil" (PIL only).
 
     Raises:
       - UnidentifiedImageError for non-images
       - Other exceptions for I/O, truncated images, etc.
     """
+    if backend in ("auto", "vips"):
+        try:
+            return decode_rgb_u8_chw_vips(path)
+        except ImportError:
+            if backend == "vips":
+                raise
+        except Exception:
+            if backend == "vips":
+                raise
+
+    # PIL fallback (original implementation)
     with Image.open(path) as img:
         try:
             if getattr(img, "n_frames", 1) > 1:

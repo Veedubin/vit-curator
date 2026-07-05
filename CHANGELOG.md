@@ -5,6 +5,19 @@ All notable changes to ViT-Curator are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-07-04
+
+### Added
+- **P0-2: libvips decode backend** — `decode_rgb_u8_chw_vips()` with PIL fallback. `backend="auto"|"vips"|"pil"` parameter. 3-10x faster batch decode.
+- **P1-4: NetworkX pipeline DAG** — `--parallel` flag on `run-all`. `_build_pipeline_dag()`, `_run_stages_parallel()` with `ThreadPoolExecutor`. `networkx>=3.2` added to core deps.
+- **P1-5: NetworkX document layout graphs** — New `post/layout_graph.py` with `DocumentLayoutGraph` class. New `layout-graph` CLI command. Reading order inference, table detection, region grouping, GraphML export.
+- **P2: NetworkX knowledge graph** — New `post/knowledge_graph.py` with `ImageKnowledgeGraph` class. Cross-document entity linking, Jaccard similarity search, co-occurrence analysis, concept hierarchy. New `knowledge-graph` CLI command.
+- **P3: LangGraph batch pipelines** — New `langgraph_pipeline.py` with `PipelineState` TypedDict, `_build_pipeline_graph()` (StateGraph with 9 stages + quality gate + conditional retry), `LangGraphExecutor` class. `--langgraph` flag on `run-all`. Mutual exclusion with `--parallel`.
+
+### Changed
+- **New CLI commands**: `layout-graph`, `knowledge-graph`, `run-all --parallel`, `run-all --langgraph`.
+- **New optional dependencies**: `[vips]` — pyvips>=2.2.0; `[langgraph]` — langgraph>=0.2.0, langgraph-checkpoint-sqlite>=2.0.0.
+
 ## [0.2.0] - 2026-06-07
 
 ### Changed
