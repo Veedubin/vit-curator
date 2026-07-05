@@ -17,19 +17,13 @@ def test_config_classes_importable() -> None:
     """Test that config classes are importable without optional deps."""
     from vit_curator.config import (
         IngestConfig,
-        LabelConfig,
         LinkMode,
-        PipelineStats,
         RunConfig,
-        TrainConfig,
     )
 
     assert callable(IngestConfig)
     assert callable(RunConfig)
-    assert callable(LabelConfig)
-    assert callable(TrainConfig)
     assert callable(LinkMode)
-    assert callable(PipelineStats)
 
 
 def test_error_classes_importable() -> None:

@@ -19,10 +19,12 @@ Provides commands for all pipeline stages:
 
 from __future__ import annotations
 
+import json
 import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import networkx as nx
 import typer
@@ -31,6 +33,10 @@ from rich.table import Table
 
 from vit_curator.shared.db import DB, connect
 from vit_curator.shared.errors import CLIError
+
+if TYPE_CHECKING:
+    from vit_curator.config import IngestConfig, RunConfig
+    from vit_curator.label.dispatcher import DispatchConfig
 
 app = typer.Typer(
     add_completion=False,
@@ -47,6 +53,301 @@ def _open_db(db_path: Path) -> DB:
     if not db_path.exists():
         db_path.parent.mkdir(parents=True, exist_ok=True)
     return connect(db_path)
+
+
+def _resolve_db_path(cfg: dict, stage: str) -> Path:
+    """Resolve the DuckDB path for a pipeline stage.
+
+    Common pattern: cfg["db"] if present, otherwise fall back to
+    cfg["preprocess"]["out"]/index.duckdb or a stage-specific default.
+    """
+    if "db" in cfg:
+        return Path(cfg["db"])
+    preprocess_out = cfg.get("preprocess", {}).get("out", "./preprocessed")
+    return Path(preprocess_out) / "index.duckdb"
+
+
+# ---------------------------------------------------------------------------
+# Config factory functions (shared by standalone commands and _run_stage)
+# ---------------------------------------------------------------------------
+
+
+def _build_ingest_config(cfg: dict) -> IngestConfig:
+    """Build an IngestConfig from a dict (YAML config or CLI kwargs)."""
+    from vit_curator.config import IngestConfig  # noqa: PLC0415
+
+    return IngestConfig(
+        dest_dir=Path(cfg.get("dest_dir", "./ingested")),
+        download_urls_file=Path(cfg["download_urls_file"])
+        if cfg.get("download_urls_file")
+        else None,
+        unarchive_source_dir=Path(cfg["unarchive_source_dir"])
+        if cfg.get("unarchive_source_dir")
+        else None,
+        download_workers=cfg.get("download_workers", 8),
+        unarchive_workers=cfg.get("unarchive_workers", 4),
+        sort_workers=cfg.get("sort_workers", 4),
+        retries=cfg.get("retries", 3),
+        timeout_s=cfg.get("timeout_s", 60),
+    )
+
+
+def _build_preprocess_config(cfg: dict) -> RunConfig:
+    """Build a RunConfig from a dict (YAML config or CLI kwargs)."""
+    from vit_curator.config import LinkMode, RunConfig  # noqa: PLC0415
+
+    return RunConfig(
+        src_root=Path(cfg.get("src", "./ingested")),
+        out_root=Path(cfg.get("out", "./preprocessed")),
+        max_files=cfg.get("max_files"),
+        bucket_size=cfg.get("bucket_size", 10_000),
+        link_mode=LinkMode(cfg.get("link_mode", "hardlink")),
+        hash_workers=cfg.get("hash_workers", 8),
+        scan_insert_batch=cfg.get("scan_insert_batch", 20_000),
+        decode_backend=cfg.get("decode_backend", "cpu"),  # type: ignore[arg-type]
+        device=cfg.get("device", "cpu"),  # type: ignore[arg-type]
+        presets_arg=cfg.get("presets", "thumb-64=64"),
+        fmt=cfg.get("fmt", "jpeg"),  # type: ignore[arg-type]
+        jpeg_quality=cfg.get("jpeg_quality", 80),
+        preserve_source=cfg.get("preserve_source", False),
+        preserve_color=cfg.get("preserve_color", False),
+        preserve_quality=cfg.get("preserve_quality", False),
+        decode_batch=cfg.get("decode_batch", 64),
+        inflight_batches=cfg.get("inflight_batches", 4),
+        writer_workers=cfg.get("writer_workers", 4),
+        metrics_every_s=cfg.get("metrics_every_s", 2.0),
+        dali_batch_multiplier=cfg.get("dali_batch_multiplier", 4),
+        crop=cfg.get("crop", False),
+        deskew=cfg.get("deskew", False),
+    )
+
+
+def _build_dispatch_config(cfg: dict) -> DispatchConfig:
+    """Build a DispatchConfig from a dict (YAML config or CLI kwargs)."""
+    from vit_curator.label.dispatcher import DispatchConfig  # noqa: PLC0415
+    from vit_curator.label.prompt import build_prompt, load_labelset  # noqa: PLC0415
+    from vit_curator.label.store import connect_label_db  # noqa: PLC0415
+
+    db_path = Path(
+        cfg.get("db", cfg.get("preprocess", {}).get("out", "./preprocessed")) / "index.duckdb"
+    )
+    conn = connect_label_db(db_path)
+    labels_path = Path(cfg.get("labels_file", "configs/labels.default.json"))
+    labelset = load_labelset(str(labels_path)) if labels_path.exists() else None
+    if labelset is not None:
+        bundle = build_prompt(labelset)
+        prompt_text = bundle.prompt
+        prompt_schema = bundle.schema
+    else:
+        prompt_text = ""
+        prompt_schema = None
+
+    dispatch_cfg = DispatchConfig(
+        run_id="",
+        server_url=cfg.get("server_url", "http://localhost:8000"),
+        model=cfg.get("model", "Qwen/Qwen3-VL-7B-Instruct"),
+        prompt=prompt_text,
+        schema=prompt_schema,
+        include_text=True,
+        include_subject=False,
+        include_entities=False,
+        include_summary=False,
+        text_output_dir=None,
+        output_root=None,
+        output_ext="json",
+        max_inflight=cfg.get("max_inflight", 32),
+        batch_size=cfg.get("batch_size", 64),
+        max_tokens=cfg.get("max_tokens", 64),
+        temperature=cfg.get("temperature", 0.0),
+        timeout_s=cfg.get("timeout_s", 120.0),
+        stream=False,
+        stream_include_usage=False,
+        dynamic_concurrency=cfg.get("dynamic_concurrency", False),
+        min_inflight=cfg.get("min_inflight", 8),
+        max_inflight_cap=cfg.get("max_inflight_cap", 256),
+        ema_halflife_s=cfg.get("ema_halflife_s", 30.0),
+        auto_tune=cfg.get("auto_tune", False),
+        min_batch_size=cfg.get("min_batch_size", 32),
+        max_batch_size=cfg.get("max_batch_size", 128),
+        batch_step=cfg.get("batch_step", 16),
+        target_p95_ms=cfg.get("target_p95_ms", 5000.0),
+        target_ttft_ms=cfg.get("target_ttft_ms"),
+        min_tok_s=cfg.get("min_tok_s"),
+        max_err_rate=cfg.get("max_err_rate", 0.05),
+        warmup_batches=cfg.get("warmup_batches", 3),
+        tune_interval_s=cfg.get("tune_interval_s", 30.0),
+        max_attempts=cfg.get("max_attempts", 3),
+        retry_backoff_s=cfg.get("retry_backoff_s", 1.0),
+        retry_backoff_mult=cfg.get("retry_backoff_mult", 2.0),
+        retry_backoff_cap_s=cfg.get("retry_backoff_cap_s", 60.0),
+        uncertain_label_ids=(),
+        use_dashboard=True,
+        metrics_interval_s=cfg.get("metrics_interval_s", 2.0),
+    )
+    return dispatch_cfg, conn
+
+
+# ---------------------------------------------------------------------------
+# Stage runner functions (extracted from _run_stage)
+# ---------------------------------------------------------------------------
+
+
+def _run_ingest_stage(cfg: dict, console: Console) -> None:
+    """Run the ingest pipeline stage."""
+    from vit_curator.ingest.pipeline import run_ingest  # noqa: PLC0415
+
+    ingest_cfg = _build_ingest_config(cfg)
+    result_dir = run_ingest(ingest_cfg)
+    console.print(f"  Ingested files: {result_dir}")
+
+
+def _run_preprocess_stage(cfg: dict, console: Console) -> None:
+    """Run the preprocess pipeline stage."""
+    from vit_curator.preprocess import run_pipeline  # noqa: PLC0415
+
+    run_cfg = _build_preprocess_config(cfg)
+    run_pipeline(run_cfg)
+    console.print(f"  Preprocessed to: {run_cfg.out_root}")
+
+
+def _run_label_stage(cfg: dict, console: Console) -> None:
+    """Run the label pipeline stage."""
+    import asyncio  # noqa: PLC0415
+
+    from vit_curator.label.dispatcher import run_dispatch_loop  # noqa: PLC0415
+
+    dispatch_cfg, conn = _build_dispatch_config(cfg)
+    asyncio.run(run_dispatch_loop(conn=conn, cfg=dispatch_cfg, console=console))
+
+
+def _run_train_stage(cfg: dict, console: Console) -> None:
+    """Run the train pipeline stage."""
+    from vit_curator.train.train import train_model  # noqa: PLC0415
+
+    db_path = Path(cfg.get("db", "./preprocessed/index.duckdb"))
+    train_model(
+        db_path=db_path,
+        run_id=cfg.get("run_id", ""),
+        output_path=Path(cfg.get("output_path", "./models/model.pkl")),
+        model_arch=cfg.get("model_arch", "vit"),
+        epochs=cfg.get("epochs", 10),
+        lr=cfg.get("lr", 1e-3),
+        batch_size=cfg.get("batch_size", 64),
+    )
+
+
+def _run_evaluate_stage(cfg: dict, console: Console) -> None:
+    """Run the evaluate pipeline stage."""
+    from vit_curator.train.evaluate import evaluate_run  # noqa: PLC0415
+
+    metrics = evaluate_run(
+        db_path=Path(cfg.get("db", "./preprocessed/index.duckdb")),
+        run_id=cfg.get("run_id", ""),
+        model_path=Path(cfg.get("model", "./models/model.pkl")),
+    )
+    console.print(f"  Evaluation metrics: {metrics}")
+
+
+def _run_predict_stage(cfg: dict, console: Console) -> None:
+    """Run the predict pipeline stage."""
+    from vit_curator.train.predict import predict_run  # noqa: PLC0415
+
+    n = predict_run(
+        model_path=Path(cfg.get("model", "./models/model.pkl")),
+        db_path=Path(cfg.get("db", "./preprocessed/index.duckdb")),
+        target_run_id=cfg.get("target_run_id"),
+    )
+    console.print(f"  Predictions: {n} files processed")
+
+
+def _run_chunk_stage(cfg: dict, console: Console) -> None:
+    """Run the chunk pipeline stage."""
+    from vit_curator.post.chunk import ChunkConfig, Chunker  # noqa: PLC0415
+
+    database = _open_db(Path(cfg.get("db", "./preprocessed/index.duckdb")))
+    chunk_cfg = ChunkConfig(
+        chunk_chars=cfg.get("chunk_chars", 1200),
+        chunk_overlap=cfg.get("chunk_overlap", 200),
+        source_column=cfg.get("source_column", "text"),
+    )
+    chunker = Chunker(chunk_cfg)
+    source = cfg.get("source", "predictions")
+    if source == "predictions":
+        n = chunker.chunk_predictions(
+            database.con,
+            run_id=cfg.get("run_id"),
+            max_docs=cfg.get("max_docs"),
+        )
+    elif source == "files":
+        n = chunker.chunk_files(
+            database.con,
+            text_dir=Path(cfg.get("text_dir", ".")),
+            max_docs=cfg.get("max_docs"),
+        )
+    else:
+        raise ValueError(f"Unknown chunk source: {source}")
+    console.print(f"  Chunked {n} documents")
+
+
+def _run_embed_stage(cfg: dict, console: Console) -> None:
+    """Run the embed pipeline stage."""
+    from vit_curator.post.embed import run_embedding  # noqa: PLC0415
+
+    database = _open_db(Path(cfg.get("db", "./preprocessed/index.duckdb")))
+    n = run_embedding(
+        database.con,
+        model_name=cfg.get("model_name", "sentence-transformers/all-MiniLM-L6-v2"),
+        device=cfg.get("device", "cpu"),
+        batch_size=cfg.get("batch_size", 64),
+        max_chunks=cfg.get("max_chunks"),
+    )
+    console.print(f"  Embedded {n} chunks")
+
+
+def _run_enrich_stage(cfg: dict, console: Console) -> None:
+    """Run the enrich pipeline stage."""
+    from vit_curator.config import EnrichConfig  # noqa: PLC0415
+    from vit_curator.post.enrich import Enricher  # noqa: PLC0415
+
+    database = _open_db(Path(cfg.get("db", "./preprocessed/index.duckdb")))
+    enrich_cfg = EnrichConfig(
+        db_path=Path(cfg.get("db", "./preprocessed/index.duckdb")),
+        server_url=cfg.get("server_url", "http://localhost:9001"),
+        api_key=cfg.get("api_key", ""),
+        model=cfg.get("model", "Qwen2.5-7B-Instruct"),
+        max_tokens=cfg.get("max_tokens", 8192),
+        max_output_tokens=cfg.get("max_output_tokens", 512),
+        tokens_per_word=cfg.get("tokens_per_word", 1.4),
+        chars_per_word=cfg.get("chars_per_word", 5.0),
+        skip_too_long=cfg.get("skip_too_long", False),
+        reprocess_existing=cfg.get("reprocess_existing", False),
+        max_docs=cfg.get("max_docs"),
+    )
+    enricher = Enricher(enrich_cfg)
+    n = enricher.enrich(database.con, console=console)
+    console.print(f"  Enriched {n} documents")
+
+
+# Stage dispatch table
+_stage_runners: dict[str, Any] = {
+    "ingest": _run_ingest_stage,
+    "preprocess": _run_preprocess_stage,
+    "label": _run_label_stage,
+    "train": _run_train_stage,
+    "evaluate": _run_evaluate_stage,
+    "predict": _run_predict_stage,
+    "chunk": _run_chunk_stage,
+    "embed": _run_embed_stage,
+    "enrich": _run_enrich_stage,
+}
+
+
+def _run_stage(stage: str, cfg: dict, console: Console) -> None:
+    """Execute a single pipeline stage from its configuration dict."""
+    runner = _stage_runners.get(stage)
+    if runner is None:
+        raise ValueError(f"Unknown stage: {stage}")
+    runner(cfg, console)
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +680,76 @@ def dashboard(
 # ---------------------------------------------------------------------------
 
 
+_AVAILABLE_STAGES = [
+    "ingest",
+    "preprocess",
+    "label",
+    "train",
+    "evaluate",
+    "predict",
+    "chunk",
+    "embed",
+    "enrich",
+]
+
+
+def _validate_run_all_config(cfg_data: dict, stages: str | None) -> tuple[list[str], list[str]]:
+    """Validate the run-all YAML config and determine stages to run.
+
+    Returns (stages_to_run, selected_stages) where selected_stages is
+    the user-provided stage list (empty if none specified).
+    """
+    selected_stages = [s.strip() for s in (stages or "").split(",") if s.strip()] if stages else []
+    if selected_stages:
+        invalid = [s for s in selected_stages if s not in _AVAILABLE_STAGES]
+        if invalid:
+            console.print(f"[red]Invalid stages: {invalid}. Valid: {_AVAILABLE_STAGES}[/]")
+            raise typer.Exit(1)
+        stages_to_run = [s for s in _AVAILABLE_STAGES if s in selected_stages]
+    else:
+        stages_to_run = [s for s in _AVAILABLE_STAGES if s in cfg_data]
+
+    if not stages_to_run:
+        console.print(
+            "[yellow]No stages configured. Add sections: "
+            "ingest, preprocess, label, train, evaluate, predict, chunk, embed, enrich[/]"
+        )
+        raise typer.Exit(0)
+
+    return stages_to_run, selected_stages
+
+
+def _print_dry_run(
+    stages_to_run: list[str],
+    cfg_data: dict,
+    parallel: bool,
+) -> None:
+    """Print dry-run output showing what would be executed."""
+    console.print(f"[cyan]{'=' * 60}[/]")
+    console.print("[cyan]DRY RUN — Configuration Valid[/]")
+    console.print(f"[cyan]Stages to run: {', '.join(stages_to_run)}[/]")
+    if parallel:
+        G = _build_pipeline_dag(stages_to_run)
+        if nx.is_directed_acyclic_graph(G):
+            generations = list(nx.topological_generations(G))
+            console.print("[cyan]DAG execution plan (parallel groups):[/]")
+            for gen_idx, generation in enumerate(generations):
+                console.print(f"  Gen {gen_idx}: {', '.join(generation)}")
+            try:
+                critical_path = nx.dag_longest_path(G)
+                console.print(f"[cyan]Critical path: {' → '.join(critical_path)}[/]")
+            except Exception:
+                pass
+        else:
+            console.print("[red]DAG contains cycles — would fall back to sequential[/]")
+    for stage in stages_to_run:
+        stage_cfg = cfg_data.get(stage, {})
+        console.print(f"\n[bold]{stage}:[/]")
+        for k, v in stage_cfg.items():
+            console.print(f"  {k}: {v}")
+    console.print(f"\n[cyan]{'=' * 60}[/]")
+
+
 @app.command("run-all")
 def run_all(
     config: Path = typer.Option(..., "--config", help="YAML config file for pipeline chaining"),
@@ -417,66 +788,15 @@ def run_all(
         console.print("[red]Config must be a YAML mapping (dictionary).[/]")
         raise typer.Exit(1)
 
-    # Determine which stages to run
-    available_stages = [
-        "ingest",
-        "preprocess",
-        "label",
-        "train",
-        "evaluate",
-        "predict",
-        "chunk",
-        "embed",
-        "enrich",
-    ]
-    selected_stages = [s.strip() for s in (stages or "").split(",") if s.strip()] if stages else []
-    if selected_stages:
-        # Validate stage names
-        invalid = [s for s in selected_stages if s not in available_stages]
-        if invalid:
-            console.print(f"[red]Invalid stages: {invalid}. Valid: {available_stages}[/]")
-            raise typer.Exit(1)
-        stages_to_run = [s for s in available_stages if s in selected_stages]
-    else:
-        stages_to_run = [s for s in available_stages if s in cfg_data]
+    stages_to_run, _selected = _validate_run_all_config(cfg_data, stages)
 
     if parallel and langgraph:
         console.print("[red]--parallel and --langgraph are mutually exclusive.[/]")
         raise typer.Exit(1)
 
-    if not stages_to_run:
-        console.print(
-            "[yellow]No stages configured. Add sections: "
-            "ingest, preprocess, label, train, evaluate, predict, chunk, embed, enrich[/]"
-        )
-        raise typer.Exit(0)
-
     # Dry run: just validate and report
     if dry_run:
-        console.print(f"[cyan]{'=' * 60}[/]")
-        console.print("[cyan]DRY RUN — Configuration Valid[/]")
-        console.print(f"[cyan]Config file: {config}[/]")
-        console.print(f"[cyan]Stages to run: {', '.join(stages_to_run)}[/]")
-        if parallel:
-            G = _build_pipeline_dag(stages_to_run)
-            if nx.is_directed_acyclic_graph(G):
-                generations = list(nx.topological_generations(G))
-                console.print("[cyan]DAG execution plan (parallel groups):[/]")
-                for gen_idx, generation in enumerate(generations):
-                    console.print(f"  Gen {gen_idx}: {', '.join(generation)}")
-                try:
-                    critical_path = nx.dag_longest_path(G)
-                    console.print(f"[cyan]Critical path: {' → '.join(critical_path)}[/]")
-                except Exception:
-                    pass
-            else:
-                console.print("[red]DAG contains cycles — would fall back to sequential[/]")
-        for stage in stages_to_run:
-            stage_cfg = cfg_data.get(stage, {})
-            console.print(f"\n[bold]{stage}:[/]")
-            for k, v in stage_cfg.items():
-                console.print(f"  {k}: {v}")
-        console.print(f"\n[cyan]{'=' * 60}[/]")
+        _print_dry_run(stages_to_run, cfg_data, parallel)
         return
 
     pipeline_name = cfg_data.get("pipeline", {}).get("name", "vit-curator")
@@ -752,228 +1072,6 @@ def _run_stages_langgraph(
         return False
 
 
-def _run_stage(stage: str, cfg: dict, console: Console) -> None:
-    """Execute a single pipeline stage from its configuration dict."""
-    if stage == "ingest":
-        from vit_curator.config import IngestConfig  # noqa: PLC0415
-        from vit_curator.ingest.pipeline import run_ingest  # noqa: PLC0415
-
-        ingest_cfg = IngestConfig(
-            dest_dir=Path(cfg.get("dest_dir", "./ingested")),
-            download_urls_file=Path(cfg["download_urls_file"])
-            if cfg.get("download_urls_file")
-            else None,
-            unarchive_source_dir=Path(cfg["unarchive_source_dir"])
-            if cfg.get("unarchive_source_dir")
-            else None,
-            download_workers=cfg.get("download_workers", 8),
-            unarchive_workers=cfg.get("unarchive_workers", 4),
-            sort_workers=cfg.get("sort_workers", 4),
-            retries=cfg.get("retries", 3),
-            timeout_s=cfg.get("timeout_s", 60),
-        )
-        result_dir = run_ingest(ingest_cfg)
-        console.print(f"  Ingested files: {result_dir}")
-
-    elif stage == "preprocess":
-        from vit_curator.config import LinkMode, RunConfig  # noqa: PLC0415
-        from vit_curator.preprocess import run_pipeline  # noqa: PLC0415
-
-        run_cfg = RunConfig(
-            src_root=Path(cfg.get("src", "./ingested")),
-            out_root=Path(cfg.get("out", "./preprocessed")),
-            max_files=cfg.get("max_files"),
-            bucket_size=cfg.get("bucket_size", 10_000),
-            link_mode=LinkMode(cfg.get("link_mode", "hardlink")),
-            hash_workers=cfg.get("hash_workers", 8),
-            scan_insert_batch=cfg.get("scan_insert_batch", 20_000),
-            decode_backend=cfg.get("decode_backend", "cpu"),  # type: ignore[arg-type]
-            device=cfg.get("device", "cpu"),  # type: ignore[arg-type]
-            presets_arg=cfg.get("presets", "thumb-64=64"),
-            fmt=cfg.get("fmt", "jpeg"),  # type: ignore[arg-type]
-            jpeg_quality=cfg.get("jpeg_quality", 80),
-            preserve_source=cfg.get("preserve_source", False),
-            preserve_color=cfg.get("preserve_color", False),
-            preserve_quality=cfg.get("preserve_quality", False),
-            decode_batch=cfg.get("decode_batch", 64),
-            inflight_batches=cfg.get("inflight_batches", 4),
-            writer_workers=cfg.get("writer_workers", 4),
-            metrics_every_s=cfg.get("metrics_every_s", 2.0),
-            dali_batch_multiplier=cfg.get("dali_batch_multiplier", 4),
-            crop=cfg.get("crop", False),
-            deskew=cfg.get("deskew", False),
-        )
-        run_pipeline(run_cfg)
-        console.print(f"  Preprocessed to: {run_cfg.out_root}")
-
-    elif stage == "label":
-        import asyncio  # noqa: PLC0415
-
-        from vit_curator.label.dispatcher import (  # noqa: PLC0415
-            DispatchConfig,
-            run_dispatch_loop,
-        )
-        from vit_curator.label.prompt import build_prompt, load_labelset  # noqa: PLC0415
-        from vit_curator.label.store import connect_label_db  # noqa: PLC0415
-
-        db_path = Path(
-            cfg.get("db", cfg.get("preprocess", {}).get("out", "./preprocessed")) / "index.duckdb"
-        )
-        conn = connect_label_db(db_path)
-        labels_path = Path(cfg.get("labels_file", "configs/labels.default.json"))
-        labelset = load_labelset(str(labels_path)) if labels_path.exists() else None
-        if labelset is not None:
-            bundle = build_prompt(labelset)
-            prompt_text = bundle.prompt
-            prompt_schema = bundle.schema
-        else:
-            prompt_text = ""
-            prompt_schema = None
-
-        dispatch_cfg = DispatchConfig(
-            run_id="",
-            server_url=cfg.get("server_url", "http://localhost:8000"),
-            model=cfg.get("model", "Qwen/Qwen3-VL-7B-Instruct"),
-            prompt=prompt_text,
-            schema=prompt_schema,
-            include_text=True,
-            include_subject=False,
-            include_entities=False,
-            include_summary=False,
-            text_output_dir=None,
-            output_root=None,
-            output_ext="json",
-            max_inflight=cfg.get("max_inflight", 32),
-            batch_size=cfg.get("batch_size", 64),
-            max_tokens=cfg.get("max_tokens", 64),
-            temperature=cfg.get("temperature", 0.0),
-            timeout_s=cfg.get("timeout_s", 120.0),
-            stream=False,
-            stream_include_usage=False,
-            dynamic_concurrency=cfg.get("dynamic_concurrency", False),
-            min_inflight=cfg.get("min_inflight", 8),
-            max_inflight_cap=cfg.get("max_inflight_cap", 256),
-            ema_halflife_s=cfg.get("ema_halflife_s", 30.0),
-            auto_tune=cfg.get("auto_tune", False),
-            min_batch_size=cfg.get("min_batch_size", 32),
-            max_batch_size=cfg.get("max_batch_size", 128),
-            batch_step=cfg.get("batch_step", 16),
-            target_p95_ms=cfg.get("target_p95_ms", 5000.0),
-            target_ttft_ms=cfg.get("target_ttft_ms"),
-            min_tok_s=cfg.get("min_tok_s"),
-            max_err_rate=cfg.get("max_err_rate", 0.05),
-            warmup_batches=cfg.get("warmup_batches", 3),
-            tune_interval_s=cfg.get("tune_interval_s", 30.0),
-            max_attempts=cfg.get("max_attempts", 3),
-            retry_backoff_s=cfg.get("retry_backoff_s", 1.0),
-            retry_backoff_mult=cfg.get("retry_backoff_mult", 2.0),
-            retry_backoff_cap_s=cfg.get("retry_backoff_cap_s", 60.0),
-            uncertain_label_ids=(),
-            use_dashboard=True,
-            metrics_interval_s=cfg.get("metrics_interval_s", 2.0),
-        )
-        asyncio.run(run_dispatch_loop(conn=conn, cfg=dispatch_cfg, console=console))
-
-    elif stage == "train":
-        from vit_curator.train.train import train_model  # noqa: PLC0415
-
-        db_path = Path(cfg.get("db", "./preprocessed/index.duckdb"))
-        train_model(
-            db_path=db_path,
-            run_id=cfg.get("run_id", ""),
-            output_path=Path(cfg.get("output_path", "./models/model.pkl")),
-            model_arch=cfg.get("model_arch", "vit"),
-            epochs=cfg.get("epochs", 10),
-            lr=cfg.get("lr", 1e-3),
-            batch_size=cfg.get("batch_size", 64),
-        )
-
-    elif stage == "evaluate":
-        from vit_curator.train.evaluate import evaluate_run  # noqa: PLC0415
-
-        metrics = evaluate_run(
-            db_path=Path(cfg.get("db", "./preprocessed/index.duckdb")),
-            run_id=cfg.get("run_id", ""),
-            model_path=Path(cfg.get("model", "./models/model.pkl")),
-        )
-        console.print(f"  Evaluation metrics: {metrics}")
-
-    elif stage == "predict":
-        from vit_curator.train.predict import predict_run  # noqa: PLC0415
-
-        n = predict_run(
-            model_path=Path(cfg.get("model", "./models/model.pkl")),
-            db_path=Path(cfg.get("db", "./preprocessed/index.duckdb")),
-            target_run_id=cfg.get("target_run_id"),
-        )
-        console.print(f"  Predictions: {n} files processed")
-
-    elif stage == "chunk":
-        from vit_curator.post.chunk import ChunkConfig, Chunker  # noqa: PLC0415
-
-        database = _open_db(Path(cfg.get("db", "./preprocessed/index.duckdb")))
-        chunk_cfg = ChunkConfig(
-            chunk_chars=cfg.get("chunk_chars", 1200),
-            chunk_overlap=cfg.get("chunk_overlap", 200),
-            source_column=cfg.get("source_column", "text"),
-        )
-        chunker = Chunker(chunk_cfg)
-        source = cfg.get("source", "predictions")
-        if source == "predictions":
-            n = chunker.chunk_predictions(
-                database.con,
-                run_id=cfg.get("run_id"),
-                max_docs=cfg.get("max_docs"),
-            )
-        elif source == "files":
-            n = chunker.chunk_files(
-                database.con,
-                text_dir=Path(cfg.get("text_dir", ".")),
-                max_docs=cfg.get("max_docs"),
-            )
-        else:
-            raise ValueError(f"Unknown chunk source: {source}")
-        console.print(f"  Chunked {n} documents")
-
-    elif stage == "embed":
-        from vit_curator.post.embed import run_embedding  # noqa: PLC0415
-
-        database = _open_db(Path(cfg.get("db", "./preprocessed/index.duckdb")))
-        n = run_embedding(
-            database.con,
-            model_name=cfg.get("model_name", "sentence-transformers/all-MiniLM-L6-v2"),
-            device=cfg.get("device", "cpu"),
-            batch_size=cfg.get("batch_size", 64),
-            max_chunks=cfg.get("max_chunks"),
-        )
-        console.print(f"  Embedded {n} chunks")
-
-    elif stage == "enrich":
-        from vit_curator.config import EnrichConfig  # noqa: PLC0415
-        from vit_curator.post.enrich import Enricher  # noqa: PLC0415
-
-        database = _open_db(Path(cfg.get("db", "./preprocessed/index.duckdb")))
-        enrich_cfg = EnrichConfig(
-            db_path=Path(cfg.get("db", "./preprocessed/index.duckdb")),
-            server_url=cfg.get("server_url", "http://localhost:9001"),
-            api_key=cfg.get("api_key", ""),
-            model=cfg.get("model", "Qwen2.5-7B-Instruct"),
-            max_tokens=cfg.get("max_tokens", 8192),
-            max_output_tokens=cfg.get("max_output_tokens", 512),
-            tokens_per_word=cfg.get("tokens_per_word", 1.4),
-            chars_per_word=cfg.get("chars_per_word", 5.0),
-            skip_too_long=cfg.get("skip_too_long", False),
-            reprocess_existing=cfg.get("reprocess_existing", False),
-            max_docs=cfg.get("max_docs"),
-        )
-        enricher = Enricher(enrich_cfg)
-        n = enricher.enrich(database.con, console=console)
-        console.print(f"  Enriched {n} documents")
-
-    else:
-        raise ValueError(f"Unknown stage: {stage}")
-
-
 # ---------------------------------------------------------------------------
 # Stage 7: Post-processing (chunk, embed, enrich)
 # ---------------------------------------------------------------------------
@@ -1122,6 +1220,91 @@ def perceptual_dedupe(
 
 
 # ---------------------------------------------------------------------------
+# Shared DB query and display helpers for graph commands
+# ---------------------------------------------------------------------------
+
+
+def _query_label_rows(
+    con: Any,
+    run_id: str | None = None,
+    limit: int | None = None,
+    *,
+    include_bbox: bool = True,
+) -> list[tuple[Any, ...]]:
+    """Query label rows from DuckDB with optional filters.
+
+    Returns raw rows. Raises typer.Exit on query failure or empty result.
+    """
+    if include_bbox:
+        select = "l.text, l.bbox, l.label, l.confidence, f.file_pk"
+    else:
+        select = "f.file_pk, l.text, l.label, l.confidence"
+
+    query = f"""
+        SELECT {select}
+        FROM labels l
+        JOIN files f ON l.file_pk = f.file_pk
+        WHERE 1=1
+    """
+    params: list[Any] = []
+
+    if run_id:
+        query += " AND l.run_id = ?"
+        params.append(run_id)
+
+    if limit:
+        query += " LIMIT ?"
+        params.append(limit)
+
+    try:
+        rows = con.execute(query, params).fetchall()
+    except Exception as e:
+        console.print(f"[red]Failed to query labels: {e}[/]")
+        console.print("[yellow]Tip: Run 'label' stage first to populate label data.[/]")
+        raise typer.Exit(1) from e
+
+    if not rows:
+        console.print("[yellow]No label data found. Run the 'label' stage first.[/]")
+        raise typer.Exit(0)
+
+    return rows
+
+
+def _parse_bbox(bbox_raw: Any) -> tuple[float, float, float, float]:
+    """Parse a bbox value from the DB into (x1, y1, x2, y2)."""
+    if isinstance(bbox_raw, str):
+        try:
+            bbox_raw = json.loads(bbox_raw)
+        except json.JSONDecodeError:
+            bbox_raw = [0, 0, 0, 0]
+
+    if isinstance(bbox_raw, list) and len(bbox_raw) >= 4:
+        if len(bbox_raw) == 8:
+            xs = [bbox_raw[0], bbox_raw[2], bbox_raw[4], bbox_raw[6]]
+            ys = [bbox_raw[1], bbox_raw[3], bbox_raw[5], bbox_raw[7]]
+            return (min(xs), min(ys), max(xs), max(ys))
+        return (
+            float(bbox_raw[0]),
+            float(bbox_raw[1]),
+            float(bbox_raw[2]),
+            float(bbox_raw[3]),
+        )
+    return (0.0, 0.0, 0.0, 0.0)
+
+
+def _print_results_table(
+    title: str, rows: list[tuple[str, str]], console: Console = console
+) -> None:
+    """Print a Rich Table with two columns (Metric/Value style)."""
+    table = Table(title=title)
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", style="green")
+    for k, v in rows:
+        table.add_row(k, v)
+    console.print(table)
+
+
+# ---------------------------------------------------------------------------
 # Layout graph
 # ---------------------------------------------------------------------------
 
@@ -1150,8 +1333,6 @@ def layout_graph(
 
     Outputs GraphML for visualization in tools like Gephi or Cytoscape.
     """
-    import json  # noqa: PLC0415
-
     from vit_curator.post.layout_graph import (  # noqa: PLC0415
         DocumentLayoutGraph,
         LayoutBlock,
@@ -1160,62 +1341,13 @@ def layout_graph(
     database = _open_db(db)
     con = database.con
 
-    # Query label data from the database
-    query = """
-        SELECT l.text, l.bbox, l.label, l.confidence
-        FROM labels l
-        JOIN files f ON l.file_pk = f.file_pk
-        WHERE 1=1
-    """
-    params: list[Any] = []
-
-    if run_id:
-        query += " AND l.run_id = ?"
-        params.append(run_id)
-
-    if max_blocks:
-        query += " LIMIT ?"
-        params.append(max_blocks)
-
-    try:
-        rows = con.execute(query, params).fetchall()
-    except Exception as e:
-        console.print(f"[red]Failed to query labels: {e}[/]")
-        console.print("[yellow]Tip: Run 'label' stage first to populate label data.[/]")
-        raise typer.Exit(1) from e
-
-    if not rows:
-        console.print("[yellow]No label data found. Run the 'label' stage first.[/]")
-        raise typer.Exit(0)
+    rows = _query_label_rows(con, run_id=run_id, limit=max_blocks)
 
     # Build blocks from query results
     blocks: list[LayoutBlock] = []
     for row in rows:
         text = str(row[0]) if row[0] else ""
-        bbox_raw = row[1]
-
-        # Parse bbox (could be JSON string or list)
-        if isinstance(bbox_raw, str):
-            try:
-                bbox_raw = json.loads(bbox_raw)
-            except json.JSONDecodeError:
-                bbox_raw = [0, 0, 0, 0]
-
-        if isinstance(bbox_raw, list) and len(bbox_raw) >= 4:
-            if len(bbox_raw) == 8:
-                xs = [bbox_raw[0], bbox_raw[2], bbox_raw[4], bbox_raw[6]]
-                ys = [bbox_raw[1], bbox_raw[3], bbox_raw[5], bbox_raw[7]]
-                bbox = (min(xs), min(ys), max(xs), max(ys))
-            else:
-                bbox = (
-                    float(bbox_raw[0]),
-                    float(bbox_raw[1]),
-                    float(bbox_raw[2]),
-                    float(bbox_raw[3]),
-                )
-        else:
-            bbox = (0.0, 0.0, 0.0, 0.0)
-
+        bbox = _parse_bbox(row[1])
         blocks.append(
             LayoutBlock(
                 text=text,
@@ -1231,15 +1363,16 @@ def layout_graph(
     result = graph.analyze()
 
     # Display results
-    table = Table(title="Layout Graph Analysis")
-    table.add_column("Metric", style="cyan")
-    table.add_column("Value", style="green")
-    table.add_row("Blocks", str(result.num_blocks))
-    table.add_row("Edges", str(result.num_edges))
-    table.add_row("Reading order length", str(len(result.reading_order)))
-    table.add_row("Tables detected", str(len(result.tables)))
-    table.add_row("Regions detected", str(len(result.regions)))
-    console.print(table)
+    _print_results_table(
+        "Layout Graph Analysis",
+        [
+            ("Blocks", str(result.num_blocks)),
+            ("Edges", str(result.num_edges)),
+            ("Reading order length", str(len(result.reading_order))),
+            ("Tables detected", str(len(result.tables))),
+            ("Regions detected", str(len(result.regions))),
+        ],
+    )
 
     # Show table details
     if result.tables:
@@ -1301,40 +1434,12 @@ def knowledge_graph(
     database = _open_db(db)
     con = database.con
 
-    # Query label data from the database
-    query = """
-        SELECT f.file_pk, l.text, l.label, l.confidence
-        FROM labels l
-        JOIN files f ON l.file_pk = f.file_pk
-        WHERE l.text IS NOT NULL AND l.text != ''
-    """
-    params: list[Any] = []
-
-    if run_id:
-        query += " AND l.run_id = ?"
-        params.append(run_id)
-
-    if max_entities:
-        query += " LIMIT ?"
-        params.append(max_entities)
-
-    try:
-        rows = con.execute(query, params).fetchall()
-    except Exception as e:
-        console.print(f"[red]Failed to query labels: {e}[/]")
-        console.print("[yellow]Tip: Run 'label' stage first to populate label data.[/]")
-        raise typer.Exit(1) from e
-
-    if not rows:
-        console.print("[yellow]No label data found. Run the 'label' stage first.[/]")
-        raise typer.Exit(0)
+    rows = _query_label_rows(con, run_id=run_id, limit=max_entities, include_bbox=False)
 
     # Build knowledge graph
     kg = ImageKnowledgeGraph()
 
     # Group entities by image
-    from collections import defaultdict  # noqa: PLC0415
-
     image_entities: dict[str, list[EntityInfo]] = defaultdict(list)
 
     for row in rows:
@@ -1353,12 +1458,10 @@ def knowledge_graph(
 
     # Display stats
     stats = kg.get_stats()
-    table = Table(title="Knowledge Graph Statistics")
-    table.add_column("Metric", style="cyan")
-    table.add_column("Value", style="green")
-    for key, value in stats.items():
-        table.add_row(key.replace("_", " ").title(), f"{value:,}")
-    console.print(table)
+    _print_results_table(
+        "Knowledge Graph Statistics",
+        [(k.replace("_", " ").title(), f"{v:,}") for k, v in stats.items()],
+    )
 
     # Top entities
     top_entities = kg.get_top_entities(top_k=top_k)

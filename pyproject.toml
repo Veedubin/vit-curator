@@ -6,6 +6,21 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [{name = "Jakob Charles"}]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+keywords = ["machine-learning", "computer-vision", "image-processing", "dataset-curation", "pipeline", "vlm", "duckdb", "fastai"]
 dependencies = [
     "duckdb>=1.0.0",
     "rich>=13.7.0",
@@ -22,6 +37,7 @@ dependencies = [
     "torchvision>=0.16.0",
     "fastai>=2.7.0",
     "networkx>=3.2",
+    "pytest-asyncio>=1.4.0",
 ]
 
 [project.optional-dependencies]
@@ -87,4 +103,5 @@ markers = [
 dev = [
     "pyright>=1.1.409",
     "pytest>=9.0.3",
+    "pytest-asyncio>=1.4.0",
 ]

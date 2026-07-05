@@ -398,14 +398,12 @@ def test_e2e_run_chunking_predictions(populated_db: duckdb.DuckDBPyConnection) -
 
 
 # ---------------------------------------------------------------------------
-# Pipeline stats aggregation
+# Pipeline state verification
 # ---------------------------------------------------------------------------
 
 
 def test_e2e_pipeline_stats(populated_db: duckdb.DuckDBPyConnection) -> None:
-    """End-to-end: verify PipelineStats can be constructed from DB state."""
-    from vit_curator.config import PipelineStats
-
+    """End-to-end: verify pipeline counts from DB state."""
     con = populated_db
 
     n_files = con.execute("SELECT COUNT(*) FROM files;").fetchone()[0]
@@ -414,17 +412,6 @@ def test_e2e_pipeline_stats(populated_db: duckdb.DuckDBPyConnection) -> None:
     ]
     n_dupes = con.execute("SELECT COUNT(*) FROM files WHERE is_exact_dupe = TRUE;").fetchone()[0]
 
-    stats = PipelineStats(
-        seen=n_files,
-        inserted=n_canonical,
-        skipped=n_dupes,
-        hashed_ok=n_canonical,
-        hash_err=0,
-        canonicals=n_canonical,
-        dupes=n_dupes,
-    )
-
-    assert stats.seen == 6
-    assert stats.canonicals == 5
-    assert stats.dupes == 1
-    assert stats.hashed_ok == 5
+    assert n_files == 6
+    assert n_canonical == 5
+    assert n_dupes == 1

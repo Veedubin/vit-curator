@@ -1,3 +1,3 @@
-"""Shared infrastructure: DuckDB, hashing, progress, state, checkpoints, signals."""
+"""Shared infrastructure: DuckDB, hashing, errors."""
 
 from __future__ import annotations
