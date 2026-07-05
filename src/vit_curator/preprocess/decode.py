@@ -41,9 +41,9 @@ def decode_rgb_u8_chw_vips(path: Path) -> DecodedImage:
       - Other exceptions for I/O, truncated images, etc.
     """
     try:
-        import pyvips
+        import pyvips  # noqa: PLC0415
     except ImportError:
-        raise ImportError("pyvips is not installed. Install with: pip install pyvips")
+        raise ImportError("pyvips is not installed. Install with: pip install pyvips") from None
 
     try:
         image = pyvips.Image.new_from_file(str(path), access="sequential")

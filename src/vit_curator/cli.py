@@ -20,12 +20,12 @@ Provides commands for all pipeline stages:
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
 import networkx as nx
 import typer
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from rich.console import Console
 from rich.table import Table
 
@@ -488,7 +488,7 @@ def run_all(
     # Execute stages (langgraph, parallel, or sequential)
     if langgraph:
         try:
-            import vit_curator.langgraph_pipeline  # noqa: PLC0415
+            import vit_curator.langgraph_pipeline as _lg  # noqa: PLC0415, F401
         except ImportError:
             console.print(
                 "[red]langgraph not installed. Install with: pip install vit-curator[langgraph][/]"
@@ -679,8 +679,7 @@ def _run_stages_langgraph(
     - Quality gates: pauses at label stage for confidence review
     - Conditional retry: retries label with different model on failure
     """
-    import vit_curator.langgraph_pipeline  # noqa: PLC0415
-    from vit_curator.langgraph_pipeline import LangGraphExecutor, PipelineState
+    from vit_curator.langgraph_pipeline import LangGraphExecutor, PipelineState  # noqa: PLC0415
 
     # Determine checkpoint directory
     out_dir = cfg_data.get("pipeline", {}).get(

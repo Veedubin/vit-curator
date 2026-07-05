@@ -42,15 +42,15 @@ def _build_pipeline_graph():
     Quality gate on label stage: if OCR confidence < 80%, routes to retry_label
     which switches model and routes back to label.
     """
-    from langgraph.graph import END, StateGraph  # noqa: PLC0415
     from langgraph.checkpoint.memory import MemorySaver  # noqa: PLC0415
+    from langgraph.graph import END, StateGraph  # noqa: PLC0415
 
     # Define stage nodes
     def _make_stage_node(stage_name: str):
         """Create a node function for a pipeline stage."""
 
-    def _node(state: PipelineState) -> PipelineState:
-        from vit_curator.cli import _run_stage  # noqa: PLC0415
+        def _node(state: PipelineState) -> PipelineState:
+            from vit_curator.cli import _run_stage  # noqa: PLC0415
 
             stage_cfg = state["cfg_data"].get(stage_name, {})
             if not stage_cfg:
@@ -214,8 +214,7 @@ class LangGraphExecutor:
         """
         config = {"configurable": {"thread_id": initial_state.get("checkpoint_id", "default")}}
 
-        for event in self._graph.stream(initial_state, config):
-            yield event
+        yield from self._graph.stream(initial_state, config)
 
     def resume(self, checkpoint_id: str, approval: dict[str, Any] | None = None):
         """Resume pipeline after human-in-the-loop interruption.
@@ -232,8 +231,7 @@ class LangGraphExecutor:
         config = {"configurable": {"thread_id": checkpoint_id}}
         resume_value = Command(resume=approval) if approval else None
 
-        for event in self._graph.stream(resume_value, config):
-            yield event
+        yield from self._graph.stream(resume_value, config)
 
     def get_state(self, checkpoint_id: str) -> PipelineState | None:
         """Get the current state for a checkpoint.
